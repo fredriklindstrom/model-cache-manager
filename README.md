@@ -13,7 +13,8 @@ Works with anything that downloads through `huggingface_hub`: MLX (`mlx-lm`, `ml
 - **Every cached model in one table**: size, last-used evidence, and status. Sort by size or last use, and filter by name or note.
 - **Delete by selection**: click (or ⇧/⌘-click) the models you want gone. By default they go to the Trash as one item per model, so a mistake is recoverable. Permanent delete is an option.
 - **Shared-file safe**: the cache keeps weights in a shared, content-addressed `blobs/` store, and model folders only hold links into it. Deleting a model removes the folder *and* the blobs only that model uses. Blobs another model still needs are never touched. The size shown is what deleting actually frees.
-- **Keep**: tick it to exclude a model from auto-delete.
+- **Projects**: group models by what they're for ("Local Video Generation", "Speech", "Benchmarks"). Drag rows onto a project in the sidebar, or right-click → Add to Project. A model can be in several projects, and a whole project can be kept out of auto-delete with one switch. Deleting a project only removes the grouping, never the models.
+- **Keep**: tick it to exclude a single model from auto-delete.
 - **Notes**: a free-text comment per model ("used by my nightly job", "benchmark only, delete after Friday").
 - **Auto-delete**: remove models not used for *N* days (default 30), checked by a lightweight background agent.
 - **Locks**: a model is never deleted, by hand or automatically, while a running process names it, holds its files open, or a launch agent or daemon on your Mac refers to it.
@@ -31,6 +32,15 @@ On top of that:
 
 - **Grace period:** the auto-delete clock never starts earlier than when the app began tracking a model. Nothing is auto-deleted until it has been observed for the full period.
 - **Launch agent references:** models named in a LaunchAgent or LaunchDaemon plist are locked, so a server that's stopped right now still keeps its model.
+
+## Safety
+
+Deleting is the one thing this app must never get wrong, so:
+
+- **Nothing outside the cache.** It only removes real model folders directly inside the cache, and blobs that are real files in the cache's `blobs/` store. A "model folder" that is a symbolic link is never listed or deleted, and everything is re-checked right before it's moved.
+- **All-or-nothing Trash moves.** If any step fails, everything already moved is put back. An interrupted delete is reported in the window, not left hidden.
+- **Fresh decisions.** Deleting re-scans first, and nothing is deleted if the in-use check (`ps`/`lsof`) failed.
+- **Conservative auto-delete.** It stands down after a long gap or a clock jump (and restarts the observation period), and it won't delete more than 25 models in one unattended run.
 
 ## Install
 

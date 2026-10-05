@@ -16,11 +16,13 @@ struct CachedModel: Identifiable, Hashable {
     var inUseReason: String?                 // running process / open file / launch agent
     var excluded = false
     var note = ""
+    var projectNames: [String] = []
+    var projectKept = false        // in a project marked Keep
 
     /// Running or referenced by a launch agent: never deleted, by hand or automatically.
     var isLocked: Bool { inUseReason != nil }
     /// Never auto-deleted.
-    var isProtectedFromAuto: Bool { isLocked || excluded }
+    var isProtectedFromAuto: Bool { isLocked || excluded || projectKept }
 
     /// Latest real evidence of use. This is what the window shows.
     var lastUsed: Date {
@@ -42,6 +44,10 @@ struct CachedModel: Identifiable, Hashable {
 struct ScanResult {
     var models: [CachedModel]
     var uniqueBytes: Int64
+    /// False when the in-use checks (ps / lsof) failed; auto-delete must not run on such a scan.
+    var usageReliable = true
+    /// Hidden staging folders left by an interrupted delete (their data is still on disk).
+    var leftoverStaging: [String] = []
 }
 
 struct FileStat { let size: Int64; let atime: Date; let mtime: Date }
@@ -61,17 +67,19 @@ func realPath(_ path: String) -> String {
     return String(cString: p)
 }
 
-func runCommand(_ path: String, _ args: [String]) -> String {
+/// Runs a tool directly (no shell). `status` is -1 if it could not be started.
+@discardableResult
+func runCommand(_ path: String, _ args: [String]) -> (out: String, status: Int32) {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: path)
     p.arguments = args
     let out = Pipe()
     p.standardOutput = out
     p.standardError = FileHandle.nullDevice
-    do { try p.run() } catch { return "" }
+    do { try p.run() } catch { return ("", -1) }
     let data = out.fileHandleForReading.readDataToEndOfFile()
     p.waitUntilExit()
-    return String(decoding: data, as: UTF8.self)
+    return (String(decoding: data, as: UTF8.self), p.terminationStatus)
 }
 
 enum CacheScanner {
@@ -86,7 +94,7 @@ enum CacheScanner {
         let fm = FileManager.default
         let root = URL(fileURLWithPath: realPath(cacheRoot.path))
         guard let entries = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) else {
-            return ScanResult(models: [], uniqueBytes: 0)
+            return ScanResult(models: [], uniqueBytes: 0, usageReliable: false)
         }
 
         var models: [CachedModel] = []
@@ -100,7 +108,24 @@ enum CacheScanner {
             let kind = String(parts[0].dropLast())
             let name = parts.dropFirst().joined(separator: "/")
             let id = "\(kind)/\(name)"
-            let folder = URL(fileURLWithPath: realPath(e.path))
+            // Only real folders directly in the cache. A "model folder" that is a symlink could point
+            // at the shared blob store or another model, so it is never listed (and never deleted).
+            let folderPath = root.path + "/" + e.lastPathComponent
+            guard Deleter.isRealDirectory(folderPath) else {
+                // Not listed, but what it points at still counts as "in use by another repo",
+                // so a blob it references can never look exclusive to a real model.
+                if let en = fm.enumerator(at: URL(fileURLWithPath: realPath(folderPath)), includingPropertiesForKeys: nil) {
+                    var seen = 0
+                    for case let u as URL in en {
+                        seen += 1
+                        if seen > 20_000 { break }   // a link to somewhere huge must not stall the scan
+                        let real = realPath(u.path)
+                        if fileStat(real) != nil { reposByReal[real, default: []].insert("symlinked:" + e.lastPathComponent) }
+                    }
+                }
+                continue
+            }
+            let folder = URL(fileURLWithPath: folderPath)
             models.append(CachedModel(id: id, kind: kind, name: name, folder: folder))
 
             // Every file in the repo folder, followed through its symlinks to the real data.
@@ -153,14 +178,16 @@ enum CacheScanner {
                 models[i].inUseReason = a
             }
         }
-        return ScanResult(models: Tracker.merge(models, state), uniqueBytes: unique)
+        let staging = entries.map(\.lastPathComponent).filter { $0.hasPrefix(".mcc-staging-") }.map { root.path + "/" + $0 }
+        return ScanResult(models: Tracker.merge(models, state), uniqueBytes: unique,
+                          usageReliable: usage.reliable, leftoverStaging: staging)
     }
 }
 
 /// Finds models that something on this Mac is using right now.
 /// macOS does not update access times when model files are read, so file dates alone can't tell.
 enum UsageDetector {
-    struct Result { var running: [String: String] = [:]; var agents: [String: String] = [:] }
+    struct Result { var running: [String: String] = [:]; var agents: [String: String] = [:]; var reliable = true }
 
     static func detect(models: [CachedModel], reposByReal: [String: Set<String>], root: String) -> Result {
         var r = Result()
@@ -183,9 +210,14 @@ enum UsageDetector {
         }
 
         // 1. Process arguments, e.g. `mlx_lm.server --model org/name`.
-        for line in runCommand("/bin/ps", ["-axww", "-o", "args="]).split(separator: "\n") {
-            let s = String(line)
-            if s.contains("ModelCacheManager") { continue }
+        let ps = runCommand("/bin/ps", ["-axww", "-o", "pid=,args="])
+        if ps.status != 0 || ps.out.isEmpty { r.reliable = false }
+        let me = ProcessInfo.processInfo.processIdentifier
+        for line in ps.out.split(separator: "\n") {
+            let trimmed = line.drop { $0 == " " }
+            guard let space = trimmed.firstIndex(of: " "), let pid = Int32(trimmed[..<space]) else { continue }
+            if pid == me { continue }
+            let s = String(trimmed[space...].drop { $0 == " " })
             let exe = programName(s)
             for m in models where r.running[m.id] == nil && matches(s, m) {
                 r.running[m.id] = "In use by \(exe)"
@@ -194,11 +226,13 @@ enum UsageDetector {
 
         // 2. Files held open (including memory-mapped weights).
         var cmd = "a process"
-        for line in runCommand("/usr/sbin/lsof", ["-n", "-w", "-F", "cn"]).split(separator: "\n") {
+        let lsof = runCommand("/usr/sbin/lsof", ["-n", "-w", "-F", "cn"])
+        if lsof.status < 0 || lsof.out.isEmpty { r.reliable = false }
+        for line in lsof.out.split(separator: "\n") {
             if line.hasPrefix("c") { cmd = String(line.dropFirst()); continue }
             guard line.hasPrefix("n") else { continue }
             let path = String(line.dropFirst())
-            guard path.hasPrefix(root) else { continue }
+            guard path.hasPrefix(root + "/") else { continue }
             let ids = reposByReal[path] ?? Set(models.filter { path.hasPrefix($0.folder.path + "/") }.map(\.id))
             for id in ids where r.running[id] == nil { r.running[id] = "Open in \(cmd)" }
         }
@@ -236,6 +270,9 @@ enum Tracker {
             if let d = s.lastSeenInUse[m.id] { m.lastSeenInUse = max(m.lastSeenInUse ?? d, d) }
             m.excluded = s.excluded.contains(m.id)
             m.note = s.notes[m.id] ?? ""
+            let mine = s.projects.filter { $0.models.contains(m.id) }
+            m.projectNames = mine.map(\.name).sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+            m.projectKept = mine.contains(where: \.keep)
             return m
         }
     }
