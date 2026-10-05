@@ -165,6 +165,19 @@ enum UsageDetector {
     static func detect(models: [CachedModel], reposByReal: [String: Set<String>], root: String) -> Result {
         var r = Result()
 
+        /// The program a command line runs, skipping interpreters: `python …/mlx_lm.server --model x` → `mlx_lm.server`.
+        func programName(_ line: String) -> String {
+            let interpreters = ["python", "python3", "bash", "sh", "zsh", "node", "perl", "ruby", "env", "uv", "uvx"]
+            for token in line.split(separator: " ") {
+                let base = String(token).components(separatedBy: "/").last ?? ""
+                if base.hasPrefix("-") { continue }
+                let bare = base.lowercased().replacingOccurrences(of: #"[0-9.]+$"#, with: "", options: .regularExpression)
+                if interpreters.contains(bare) { continue }
+                return base
+            }
+            return "a process"
+        }
+
         func matches(_ text: String, _ m: CachedModel) -> Bool {
             text.contains(m.name) || text.contains(m.folder.lastPathComponent)
         }
@@ -173,7 +186,7 @@ enum UsageDetector {
         for line in runCommand("/bin/ps", ["-axww", "-o", "args="]).split(separator: "\n") {
             let s = String(line)
             if s.contains("ModelCacheManager") { continue }
-            let exe = s.split(separator: " ").first.map { String($0).components(separatedBy: "/").last ?? "" } ?? "process"
+            let exe = programName(s)
             for m in models where r.running[m.id] == nil && matches(s, m) {
                 r.running[m.id] = "In use by \(exe)"
             }

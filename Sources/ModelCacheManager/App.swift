@@ -8,7 +8,7 @@ struct ModelCacheApp: App {
         WindowGroup("Model Cache Manager") {
             ContentView()
                 .environmentObject(vm)
-                .frame(minWidth: 1000, minHeight: 640)
+                .frame(minWidth: 1080, minHeight: 640)
                 .onAppear {
                     NSApp.setActivationPolicy(.regular)
                     NSApp.activate(ignoringOtherApps: true)
@@ -271,7 +271,7 @@ struct ContentView: View {
                     }
                 }
             }
-            .width(min: 260, ideal: 360)
+            .width(min: 240, ideal: 300)
 
             TableColumn("Size", value: \.exclusiveBytes) { m in
                 Text(formatBytes(m.exclusiveBytes)).monospacedDigit()
@@ -304,7 +304,7 @@ struct ContentView: View {
             TableColumn("Note") { m in
                 NoteField(id: m.id, initial: m.note)
             }
-            .width(min: 180, ideal: 280)
+            .width(min: 220, ideal: 320)
         }
     }
 

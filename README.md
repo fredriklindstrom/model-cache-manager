@@ -6,7 +6,7 @@ A small native macOS app for the Hugging Face model cache. See what's taking up 
 
 Works with anything that downloads through `huggingface_hub`: MLX (`mlx-lm`, `mlx-vlm`), Transformers, Diffusers, and the `hf` CLI.
 
-<p align="center"><img src="docs/about.png" alt="About window" width="320"></p>
+![Model Cache Manager main window, showing a demo cache](docs/screenshot.png)
 
 ## Features
 
@@ -71,6 +71,8 @@ APP="$HOME/Applications/Model Cache Manager.app/Contents/MacOS/ModelCacheManager
 ## Rebuilding the icon
 
 `swift scripts/make_icon.swift` crops the mark from `Assets/logo.png` into `Assets/AppIcon-1024.png`. `build.sh` packages the `.icns`.
+
+<p align="center"><img src="docs/about.png" alt="About window" width="300"></p>
 
 ## License
 
