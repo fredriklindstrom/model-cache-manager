@@ -4,6 +4,20 @@ struct Settings: Codable {
     var autoDeleteEnabled = false
     var days = 30
     var moveToTrash = true
+    /// Ollama models join auto-delete only when switched on separately: models made with `ollama create`
+    /// look like pulled ones and may not be downloadable again.
+    var autoDeleteOllama = false
+
+    init() {}
+
+    // Tolerant decoding: a settings file from an older version keeps its values and gets the new defaults.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        autoDeleteEnabled = (try? c.decodeIfPresent(Bool.self, forKey: .autoDeleteEnabled)) ?? false
+        days = (try? c.decodeIfPresent(Int.self, forKey: .days)) ?? 30
+        moveToTrash = (try? c.decodeIfPresent(Bool.self, forKey: .moveToTrash)) ?? true
+        autoDeleteOllama = (try? c.decodeIfPresent(Bool.self, forKey: .autoDeleteOllama)) ?? false
+    }
 }
 
 /// A user-defined group of models, e.g. "Local Video Generation". A model can be in several projects.
@@ -78,9 +92,7 @@ enum Store {
     static func log(_ line: String) {
         let stamp = ISO8601DateFormatter.string(from: Date(), timeZone: .current,
                                                 formatOptions: [.withFullDate, .withTime, .withColonSeparatorInTime, .withSpaceBetweenDateAndTime])
-        // Repo names come from folder names on disk: escape control characters so log lines can't be forged.
-        let clean = line.unicodeScalars.map { CharacterSet.controlCharacters.contains($0) ? "?" : String($0) }.joined()
-        let text = "\(stamp)  \(clean)\n"
+        let text = "\(stamp)  \(printable(line))\n"
         if let h = try? FileHandle(forWritingTo: logURL) {
             h.seekToEndOfFile(); h.write(Data(text.utf8)); try? h.close()
         } else {
@@ -92,6 +104,12 @@ enum Store {
         guard let s = try? String(contentsOf: logURL, encoding: .utf8) else { return [] }
         return Array(s.split(separator: "\n").suffix(n).map(String.init).reversed())
     }
+}
+
+/// Names come from files on disk: control and format characters (terminal escapes, bidi overrides) become "?",
+/// so a crafted name can't forge a log line or rewrite the terminal.
+func printable(_ s: String) -> String {
+    s.unicodeScalars.map { CharacterSet.controlCharacters.contains($0) ? "?" : String($0) }.joined()
 }
 
 func formatBytes(_ b: Int64) -> String {

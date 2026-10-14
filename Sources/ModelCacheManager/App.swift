@@ -85,6 +85,8 @@ final class ViewModel: ObservableObject {
     @Published var sidebar: SidebarItem? = .all
     @Published var models: [CachedModel] = []
     @Published var uniqueBytes: Int64 = 0
+    @Published var ollamaBytes: Int64 = 0
+    @Published var ollamaPresent = false
     @Published var leftoverStaging: [String] = []
     @Published var selection = Set<CachedModel.ID>()
     @Published var sortOrder = [KeyPathComparator(\CachedModel.exclusiveBytes, order: .reverse)]
@@ -144,6 +146,8 @@ final class ViewModel: ObservableObject {
                 self.state = newState
                 self.models = merged
                 self.uniqueBytes = res.uniqueBytes
+                self.ollamaBytes = res.ollamaBytes
+                self.ollamaPresent = res.ollamaPresent
                 self.leftoverStaging = res.leftoverStaging
                 self.selection = self.selection.intersection(Set(merged.map(\.id)))
                 self.logLines = Store.recentLog(300)
@@ -505,7 +509,10 @@ struct ContentView: View {
                         .foregroundStyle(m.isLocked ? Color.orange : (kept ? Color.green : Color.secondary))
                         .frame(width: 18)
                     VStack(alignment: .leading, spacing: 1) {
-                        Text(m.name).lineLimit(1)
+                        HStack(spacing: 5) {
+                            Text(m.name).lineLimit(1)
+                            if m.store == .ollama { StoreBadge(title: "Ollama", help: "In Ollama's model store") }
+                        }
                         Text(m.inUseReason ?? m.kind)
                             .font(.caption)
                             .foregroundStyle(m.isLocked ? Color.orange : Color.secondary)
@@ -581,6 +588,12 @@ struct ContentView: View {
                     }
                     .fixedSize()
                 }
+                if vm.ollamaPresent {
+                    Toggle("Include Ollama models (models you made with `ollama create` may not be downloadable again)",
+                           isOn: Binding(get: { vm.state.settings.autoDeleteOllama },
+                                         set: { v in vm.updateSettings { $0.autoDeleteOllama = v } }))
+                        .disabled(!vm.trackingOn || !vm.state.settings.autoDeleteEnabled)
+                }
                 Picker("Deleted models go to", selection: Binding(get: { vm.state.settings.moveToTrash },
                                                                    set: { v in vm.updateSettings { $0.moveToTrash = v } })) {
                     Text("Trash (recoverable)").tag(true)
@@ -623,7 +636,9 @@ struct ContentView: View {
     private var footer: some View {
         HStack {
             if vm.scanning { ProgressView().controlSize(.small) }
-            Text("\(vm.models.count) models · \(formatBytes(vm.uniqueBytes)) in cache · \(formatBytes(vm.freeBytes)) free on disk")
+            Text("\(vm.models.count) models · \(formatBytes(vm.uniqueBytes)) in cache"
+                 + (vm.ollamaPresent ? " · \(formatBytes(vm.ollamaBytes)) in Ollama" : "")
+                 + " · \(formatBytes(vm.freeBytes)) free on disk")
                 .foregroundStyle(.secondary)
             if !vm.leftoverStaging.isEmpty {
                 Button {
@@ -640,6 +655,12 @@ struct ContentView: View {
                 NSWorkspace.shared.activateFileViewerSelecting([CacheScanner.cacheRoot])
             }
             .buttonStyle(.link)
+            if vm.ollamaPresent {
+                Button("Show Ollama Models in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([OllamaStore.root])
+                }
+                .buttonStyle(.link)
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
@@ -675,6 +696,21 @@ struct NoteField: View {
             .onChange(of: initial) { _, v in if !focused { text = v } }
             .onSubmit { vm.setNote(id, text) }
             .onChange(of: focused) { _, f in if !f { vm.setNote(id, text) } }
+    }
+}
+
+/// A small capsule next to a model's name saying which store it lives in.
+struct StoreBadge: View {
+    let title: String
+    let help: String
+    var body: some View {
+        Text(title)
+            .font(.caption2.weight(.medium))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(Capsule().fill(Color.secondary.opacity(0.15)))
+            .help(help)
     }
 }
 

@@ -2,9 +2,10 @@ import Foundation
 import Darwin
 
 enum DeleteError: LocalizedError {
-    case locked(String), unsafe(String), gone(String)
+    case locked(String), unsafe(String), gone(String), interrupted(String)
     var errorDescription: String? {
         switch self {
+        case .interrupted(let r): return "Interrupted: \(r)"
         case .locked(let r): return "Not deleted: \(r)"
         case .unsafe(let r): return "Refused: \(r)"
         case .gone(let r): return "Skipped: \(r)"
@@ -58,7 +59,8 @@ enum Deleter {
     @discardableResult
     static func delete(_ m: CachedModel, toTrash: Bool) throws -> DeleteOutcome {
         if let r = m.inUseReason { throw DeleteError.locked(r) }
-        let fm = FileManager.default
+        if let r = m.deleteBlocked { throw DeleteError.unsafe(r) }
+        if m.store == .ollama { return try deleteOllama(m, toTrash: toTrash) }
         let root = realPath(CacheScanner.cacheRoot.path)
         guard root != "/", isRealDirectory(root) else { throw DeleteError.unsafe("the cache root is not a folder") }
         let folder = try verifiedFolder(m, root: root)
@@ -67,47 +69,231 @@ enum Deleter {
         let refused = allBlobs.filter { !blobs.contains($0) }.reduce(Int64(0)) { $0 + (fileStat($1)?.size ?? 0) }
         let freed = m.exclusiveBytes - refused
 
-        guard toTrash else {
-            try fm.removeItem(atPath: folder)   // removes links inside it, never their targets
-            for b in blobs where isRemovableBlob(b, root: root) { try? fm.removeItem(atPath: b) }
-            return DeleteOutcome(freed: freed, trashLocation: nil)
+        // Each blob's folder is opened from the cache root down without following links, and the blob is
+        // removed or moved by name inside it, so a folder swapped for a link after the checks can't redirect it.
+        guard let rootDir = DirHandle.open(root) else { throw DeleteError.unsafe("couldn't open the cache root") }
+        func blobParent(_ path: String) -> (dir: DirHandle, name: String)? {
+            var parts = String(path.dropFirst(root.count + 1)).components(separatedBy: "/")
+            let name = parts.removeLast()
+            var dir = rootDir
+            for p in parts { guard let next = dir.sub(p) else { return nil }; dir = next }
+            return dir.fileSize(name) == nil ? nil : (dir, name)
         }
 
-        let holder = root + "/.mcc-staging-" + UUID().uuidString
-        let safeName = m.name.unicodeScalars
-            .map { CharacterSet.controlCharacters.contains($0) || $0 == "/" ? "-" : String($0) }
-            .joined()
-        let item = holder + "/" + safeName + " (model cache)"
-        let shared = item + "/shared-blobs"
-        try fm.createDirectory(atPath: item, withIntermediateDirectories: true)
+        let holderName = ".mcc-staging-" + UUID().uuidString
+        let folderName = (folder as NSString).lastPathComponent
 
-        var moved: [(from: String, to: String)] = []
+        guard toTrash else {
+            // Move the folder out of the cache into a fresh staging folder, then remove it through open folder
+            // handles only: a folder inside it swapped for a link mid-delete loses the link, never its target.
+            let holder = try rootDir.makeFolder(holderName)
+            do {
+                _ = try verifiedFolder(m, root: root)    // re-check immediately before the move
+                try rootDir.move(folderName, to: holder, as: folderName)
+            } catch { rootDir.removeEmptyFolder(holderName); throw error }
+            var removed: Int64
+            do { removed = try holder.removeTree(folderName) } catch {
+                // Out of the cache but not fully removed: say where the rest is (also listed as an interrupted delete).
+                let why: String
+                if case DeleteError.unsafe(let r) = error { why = r } else { why = error.localizedDescription }
+                throw DeleteError.interrupted("\(why); what's left of \(m.id) is in \(root)/\(holderName)")
+            }
+            for b in blobs where isRemovableBlob(b, root: root) {
+                if let (dir, name) = blobParent(b), let size = dir.freedSize(name), (try? dir.unlink(name)) != nil { removed += size }
+            }
+            rootDir.removeEmptyFolder(holderName)
+            return DeleteOutcome(freed: removed, trashLocation: nil)
+        }
+
+        let itemName = trashName(m.name, suffix: " (model cache)")
+        var undo: [() throws -> Void] = []          // moves back, newest first on rollback
+        var made: [(parent: DirHandle, name: String)] = []
         func rollback() {
             var stranded = false
-            for mv in moved.reversed() {
-                do { try fm.moveItem(atPath: mv.to, toPath: mv.from) } catch { stranded = true }
-            }
-            rmdir(shared); rmdir(item); rmdir(holder)   // rmdir only removes EMPTY folders
-            if stranded { Store.log("Could not fully undo a failed delete of \(m.id); its files are in \(holder)") }
+            for u in undo.reversed() { do { try u() } catch { stranded = true } }
+            for f in made.reversed() { f.parent.removeEmptyFolder(f.name) }   // only ever removes EMPTY folders
+            if stranded { Store.log("Could not fully undo a failed delete of \(m.id); its files are in \(root)/\(holderName)") }
         }
 
         do {
-            let dest = item + "/" + (folder as NSString).lastPathComponent
+            let holder = try rootDir.makeFolder(holderName); made.append((rootDir, holderName))
+            let item = try holder.makeFolder(itemName); made.append((holder, itemName))
             _ = try verifiedFolder(m, root: root)        // re-check immediately before the move
-            try fm.moveItem(atPath: folder, toPath: dest)
-            moved.append((folder, dest))
+            try rootDir.move(folderName, to: item, as: folderName)
+            undo.append { try item.move(folderName, to: rootDir, as: folderName) }
             if !blobs.isEmpty {
-                try fm.createDirectory(atPath: shared, withIntermediateDirectories: true)
+                let shared = try item.makeFolder("shared-blobs"); made.append((item, "shared-blobs"))
                 for b in blobs where isRemovableBlob(b, root: root) {   // re-checked right before each move
+                    guard let (dir, name) = blobParent(b) else { continue }
                     let flat = String(b.dropFirst(root.count + 1)).replacingOccurrences(of: "/", with: "_")
-                    try fm.moveItem(atPath: b, toPath: shared + "/" + flat)
-                    moved.append((b, shared + "/" + flat))
+                    try dir.move(name, to: shared, as: flat)
+                    undo.append { try shared.move(flat, to: dir, as: name) }
                 }
             }
-            var landed: NSURL?
-            try fm.trashItem(at: URL(fileURLWithPath: item), resultingItemURL: &landed)
-            rmdir(holder)   // now empty; never a recursive delete
-            return DeleteOutcome(freed: freed, trashLocation: landed?.path)
+            let landed = try trash(root: root, holderName: holderName, holder: holder, itemName: itemName, item: item)
+            rootDir.removeEmptyFolder(holderName)   // now empty; never a recursive delete
+            return DeleteOutcome(freed: freed, trashLocation: landed)
+        } catch {
+            rollback()
+            throw error
+        }
+    }
+
+    /// The Trash only takes a path. Right before handing it over, the path must still lead to the staging
+    /// folders we hold open (same device and inode), so a renamed holder with a link in its place can't
+    /// send something else to the Trash.
+    private static func trash(root: String, holderName: String, holder: DirHandle, itemName: String, item: DirHandle) throws -> String? {
+        let holderPath = root + "/" + holderName, itemPath = holderPath + "/" + itemName
+        guard holder.isStill(at: holderPath), item.isStill(at: itemPath) else {
+            throw DeleteError.unsafe("the staging folder changed during the delete; nothing was moved to the Trash")
+        }
+        var landed: NSURL?
+        try FileManager.default.trashItem(at: URL(fileURLWithPath: itemPath), resultingItemURL: &landed)
+        return landed?.path
+    }
+
+    // MARK: Ollama
+
+    /// An Ollama manifest must be a regular file exactly at `manifests/<host>/<namespace>/<model>/<tag>`
+    /// inside the store, with no symlink anywhere on its path. Checked right before anything is moved.
+    private static func verifiedManifest(_ m: CachedModel, root: String) throws -> String {
+        let path = m.folder.path
+        let prefix = root + "/manifests/"
+        let parts = path.hasPrefix(prefix) ? String(path.dropFirst(prefix.count)).components(separatedBy: "/") : []
+        guard OllamaStore.isValidManifestPath(parts) else {
+            throw DeleteError.unsafe("\(m.id) is not a manifest inside the Ollama store")
+        }
+        guard isRealFile(path), realPath(path) == path else {
+            throw DeleteError.unsafe("\(m.id)'s manifest is a symbolic link or not a file")
+        }
+        return path
+    }
+
+    /// An Ollama blob may only be removed if it is a regular file (not a link) named `sha256-<hex>`
+    /// directly in the store's `blobs/` folder.
+    private static func isRemovableOllamaBlob(_ path: String, root: String) -> Bool {
+        let dir = root + "/blobs/"
+        guard path.hasPrefix(dir) else { return false }
+        let name = String(path.dropFirst(dir.count))
+        return name.range(of: #"^sha256-[0-9a-f]{64}$"#, options: .regularExpression) != nil
+            && realPath(path) == path && isRealFile(path)
+    }
+
+    /// A Trash item name from a model name: no control characters or slashes, and short enough for the file system.
+    static func trashName(_ name: String, suffix: String) -> String {
+        let safe = name.unicodeScalars
+            .map { CharacterSet.controlCharacters.contains($0) || $0 == "/" || $0 == ":" ? "-" : String($0) }
+            .joined()
+        return String(safe.prefix(120)) + suffix
+    }
+
+    /// Removes an Ollama model: its manifest plus the blobs nothing else references, always as files here
+    /// (never through the Ollama server, which may be running on a different store holding a byte-identical
+    /// copy). Every folder on the way is opened without following links and held open, so the delete can't be
+    /// redirected outside the store after the checks. The Trash path stages everything first and puts it all
+    /// back if any step fails, like a Hugging Face delete.
+    private static func deleteOllama(_ m: CachedModel, toTrash: Bool) throws -> DeleteOutcome {
+        let root = realPath(OllamaStore.root.path)
+        guard OllamaStore.isPresent(root: root) else { throw DeleteError.unsafe("the Ollama store is not a folder") }
+        let manifest = try verifiedManifest(m, root: root)
+
+        // Re-read every manifest now: a pull since the scan may have started sharing one of these blobs.
+        let refs = OllamaStore.references(root: root)
+        if let why = refs.incomplete.first {
+            throw DeleteError.unsafe("couldn't read all of the Ollama store (\(why)), so a layer shared with another model can't be ruled out")
+        }
+        guard let mine = refs.manifests.first(where: { $0.path == manifest }), mine.fileDigest == m.ollamaDigest else {
+            throw DeleteError.gone("\(m.id) changed since the scan; refresh and try again")
+        }
+        if OllamaStore.downloadInProgress(root: root) {
+            throw DeleteError.locked("an Ollama download is in progress; try again when it finishes")
+        }
+        var elsewhere = refs.unlisted
+        for o in refs.manifests where o.path != manifest { elsewhere.formUnion(o.digests) }
+        // The scan's exclusive list already leaves out blobs another HF repo or Ollama model uses.
+        // A layer only this manifest uses must be removable with it. Otherwise refuse: deleting the manifest alone
+        // would orphan the layer (Ollama prunes it on its next start) and a Trash restore would come back broken.
+        for d in mine.digests.subtracting(elsewhere) {
+            let p = OllamaStore.blobPath(d, root: root)
+            var st = stat()
+            if lstat(p, &st) == 0 && !isRemovableOllamaBlob(p, root: root) {
+                throw DeleteError.unsafe("layer sha256-\(d.prefix(12))… of \(m.name) is a link, a relocated folder or oddly named, so it can't be removed with the model")
+            }
+        }
+        let blobNames = m.externalExclusiveFiles.map(\.path).filter {
+            isRemovableOllamaBlob($0, root: root) && mine.digests.contains(String($0.suffix(64))) && !elsewhere.contains(String($0.suffix(64)))
+        }.map { ($0 as NSString).lastPathComponent }
+
+        // Open the store folder by folder: root, manifests, host, namespace, model. No links anywhere.
+        let parts = String(manifest.dropFirst(root.count + 1)).components(separatedBy: "/")   // manifests/<host>/<ns>/<model>/<tag>
+        guard parts.count == 5, let rootDir = DirHandle.open(root) else { throw DeleteError.unsafe("couldn't open the Ollama store") }
+        var chain = [rootDir]
+        for p in parts.dropLast() {
+            guard let next = chain.last!.sub(p) else { throw DeleteError.unsafe("\(m.id)'s folder changed or is a symbolic link") }
+            chain.append(next)
+        }
+        let modelDir = chain.last!, tag = parts.last!
+        guard let manifestSize = modelDir.fileSize(tag) else { throw DeleteError.unsafe("\(m.id)'s manifest is a symbolic link or not a file") }
+        let blobsDir = blobNames.isEmpty ? nil : rootDir.sub("blobs")
+        if !blobNames.isEmpty && blobsDir == nil { throw DeleteError.unsafe("the Ollama blobs folder is a symbolic link or missing") }
+
+        /// Removes the now-empty model, namespace and host folders, as Ollama does; never `manifests/` itself.
+        func pruneManifestFolders() {
+            for i in stride(from: 3, through: 1, by: -1) {
+                if !chain[i].removeEmptyFolder(parts[i]) { return }
+            }
+        }
+
+        if !toTrash {
+            try modelDir.unlink(tag)
+            var freed = manifestSize
+            for b in blobNames {
+                guard let size = blobsDir!.freedSize(b) else { continue }
+                if (try? blobsDir!.unlink(b)) != nil { freed += size }
+            }
+            pruneManifestFolders()
+            return DeleteOutcome(freed: freed, trashLocation: nil)
+        }
+
+        // ONE Trash item laid out like the store (manifests/… and blobs/), so restoring is two folder moves.
+        let holderName = ".mcc-staging-" + UUID().uuidString
+        let itemName = trashName(m.name, suffix: " (ollama model)")
+        var moved: [(from: DirHandle, name: String, to: DirHandle)] = []
+        var made: [(parent: DirHandle, name: String)] = []      // folders we created, removed on rollback if empty
+        func makeFolder(_ parent: DirHandle, _ name: String) throws -> DirHandle {
+            let d = try parent.makeFolder(name)
+            made.append((parent, name))
+            return d
+        }
+        func rollback() {
+            var stranded = false
+            for mv in moved.reversed() {
+                do { try mv.to.move(mv.name, to: mv.from, as: mv.name) } catch { stranded = true }
+            }
+            for f in made.reversed() { f.parent.removeEmptyFolder(f.name) }   // only ever removes EMPTY folders
+            if stranded { Store.log("Could not fully undo a failed delete of \(m.id); its files are in \(root)/\(holderName)") }
+        }
+
+        do {
+            let holder = try makeFolder(rootDir, holderName)
+            let item = try makeFolder(holder, itemName)
+            var staged = item
+            for p in parts.dropLast() { staged = try makeFolder(staged, p) }   // manifests/<host>/<ns>/<model>
+            let stagedBlobs = blobNames.isEmpty ? nil : try makeFolder(item, "blobs")
+            var freed: Int64 = 0
+            try modelDir.move(tag, to: staged, as: tag)
+            moved.append((modelDir, tag, staged))
+            freed += manifestSize
+            for b in blobNames {
+                guard let size = blobsDir!.fileSize(b) else { continue }
+                try blobsDir!.move(b, to: stagedBlobs!, as: b)
+                moved.append((blobsDir!, b, stagedBlobs!))
+                freed += size
+            }
+            let landed = try trash(root: root, holderName: holderName, holder: holder, itemName: itemName, item: item)
+            rootDir.removeEmptyFolder(holderName)   // now empty; never a recursive delete
+            pruneManifestFolders()
+            return DeleteOutcome(freed: freed, trashLocation: landed)
         } catch {
             rollback()
             throw error

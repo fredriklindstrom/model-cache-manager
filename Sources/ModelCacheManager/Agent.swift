@@ -32,21 +32,22 @@ enum Agent {
             && (exe.hasPrefix("/Applications/") || exe.hasPrefix(home + "/Applications/"))
     }
 
-    /// The executable and cache path the installed agent currently uses, if any.
-    static var installedConfig: (exe: String, cache: String?)? {
+    /// The executable, cache, Ollama store and Ollama address the installed agent currently uses, if any.
+    static var installedConfig: (exe: String, cache: String?, ollama: String?, ollamaHost: String?)? {
         guard let d = NSDictionary(contentsOf: plistURL) as? [String: Any],
               let exe = (d["ProgramArguments"] as? [String])?.first else { return nil }
-        return (exe, (d["EnvironmentVariables"] as? [String: String])?["HF_HUB_CACHE"])
+        let env = d["EnvironmentVariables"] as? [String: String]
+        return (exe, env?["HF_HUB_CACHE"], env?["OLLAMA_MODELS"], env?["OLLAMA_HOST"])
     }
 
     /// Called at launch: only re-points the agent if the installed app moved, keeping the cache it was set up for.
     static func repointIfMoved() {
         guard isInstalled, executableIsInstalledCopy, let cfg = installedConfig,
               let exe = Bundle.main.executableURL?.path, cfg.exe != exe else { return }
-        try? install(cachePath: cfg.cache)
+        try? install(cachePath: cfg.cache, ollamaPath: cfg.ollama, ollamaHost: cfg.ollamaHost)
     }
 
-    static func install(cachePath: String? = nil) throws {
+    static func install(cachePath: String? = nil, ollamaPath: String? = nil, ollamaHost: String? = nil) throws {
         let exe = Bundle.main.executableURL?.path ?? "?"
         guard executableIsInstalledCopy else { throw AgentError.notInApplications(exe) }
         let plist: [String: Any] = [
@@ -56,8 +57,8 @@ enum Agent {
             "RunAtLoad": true,
             "ProcessType": "Background",
             "LowPriorityIO": true,
-            // launchd doesn't inherit shell variables: pin the cache the app is looking at.
-            "EnvironmentVariables": ["HF_HUB_CACHE": cachePath ?? CacheScanner.cacheRoot.path],
+            // launchd doesn't inherit shell variables: pin the cache, Ollama store and Ollama port the app is looking at.
+            "EnvironmentVariables": environment(cachePath: cachePath, ollamaPath: ollamaPath, ollamaHost: ollamaHost),
             "StandardOutPath": Store.dir.appendingPathComponent("agent.out").path,
             "StandardErrorPath": Store.dir.appendingPathComponent("agent.err").path,
         ]
@@ -66,6 +67,13 @@ enum Agent {
         runCommand("/bin/launchctl", ["bootout", "\(domain)/\(label)"])
         try data.write(to: plistURL, options: .atomic)
         runCommand("/bin/launchctl", ["bootstrap", domain, plistURL.path])
+    }
+
+    private static func environment(cachePath: String?, ollamaPath: String?, ollamaHost: String?) -> [String: String] {
+        var env = ["HF_HUB_CACHE": cachePath ?? CacheScanner.cacheRoot.path,
+                   "OLLAMA_MODELS": ollamaPath ?? OllamaStore.root.path]
+        if let h = ollamaHost ?? ProcessInfo.processInfo.environment["OLLAMA_HOST"], !h.isEmpty { env["OLLAMA_HOST"] = h }
+        return env
     }
 
     static func uninstall() {
@@ -81,7 +89,7 @@ enum Agent {
 
     static func candidates(_ models: [CachedModel], _ s: AppState) -> [CachedModel] {
         let c = cutoff(s)
-        return models.filter { !$0.isProtectedFromAuto && $0.autoClock < c }
+        return models.filter { !$0.isProtectedFromAuto && $0.autoClock < c && ($0.store == .hf || s.settings.autoDeleteOllama) }
     }
 
     /// Reasons not to auto-delete anything this run, or nil if it's safe to proceed.
