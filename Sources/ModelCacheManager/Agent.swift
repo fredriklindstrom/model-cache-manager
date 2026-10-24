@@ -89,7 +89,14 @@ enum Agent {
 
     static func candidates(_ models: [CachedModel], _ s: AppState) -> [CachedModel] {
         let c = cutoff(s)
-        return models.filter { !$0.isProtectedFromAuto && $0.autoClock < c && ($0.store == .hf || s.settings.autoDeleteOllama) }
+        return models.filter { m in
+            guard !m.isProtectedFromAuto, m.autoClock < c else { return false }
+            switch m.store {
+            case .hf: return true
+            case .ollama: return s.settings.autoDeleteOllama
+            case .folder: return s.settings.autoDeleteFolders
+            }
+        }
     }
 
     /// Reasons not to auto-delete anything this run, or nil if it's safe to proceed.
@@ -115,7 +122,7 @@ enum Agent {
         // Delete nothing this run and restart the observation period instead.
         let gap = previousTick.map { now.timeIntervalSince($0) > 7 * 86_400 || $0 > now.addingTimeInterval(3600) } ?? false
         let state = Store.update { s in
-            Tracker.record(res.models, into: &s)
+            Tracker.record(res, into: &s)
             if gap { for m in res.models { s.firstSeen[m.id] = now } }
             if !forceDelete { s.lastTick = now }
         }
@@ -139,8 +146,15 @@ enum Agent {
 
         var done: [String] = []
         for m in targets {
+            // Re-read the settings before each delete: Keep, a switch turned off or a folder no longer watched since
+            // this run started wins (review L7).
+            let now = Store.load()
+            let stillWanted = (forceDelete || now.settings.autoDeleteEnabled)
+                && candidates(Tracker.merge([m], now), now).contains { $0.id == m.id }
+                && (m.store != .folder || m.folderRoot.map(now.settings.modelFolders.contains) == true)
+            guard stillWanted else { Store.log("Auto-delete skipped \(m.id): settings changed during the run"); continue }
             do {
-                let outcome = try Deleter.delete(m, toTrash: state.settings.moveToTrash)
+                let outcome = try Deleter.delete(m, toTrash: now.settings.moveToTrash)
                 let line = "Auto-deleted \(m.id) (\(formatBytes(outcome.freed))) to \(state.settings.moveToTrash ? "Trash" : "permanent delete"), last used \(m.lastUsed.formatted(date: .abbreviated, time: .omitted)) [\(m.lastUsedSource)]"
                 Store.log(line); done.append(line)
             } catch {

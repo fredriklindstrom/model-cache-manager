@@ -7,6 +7,12 @@ struct Settings: Codable {
     /// Ollama models join auto-delete only when switched on separately: models made with `ollama create`
     /// look like pulled ones and may not be downloadable again.
     var autoDeleteOllama = false
+    /// Folders of models outside both stores (benchmark downloads, `hf download --local-dir`, GGUFs): each folder
+    /// or model file directly inside one is listed. Real (symlink-free) absolute paths.
+    var modelFolders: [String] = []
+    /// Models in those folders join auto-delete only when switched on separately: nothing there can be assumed
+    /// to be downloadable again.
+    var autoDeleteFolders = false
 
     init() {}
 
@@ -17,6 +23,8 @@ struct Settings: Codable {
         days = (try? c.decodeIfPresent(Int.self, forKey: .days)) ?? 30
         moveToTrash = (try? c.decodeIfPresent(Bool.self, forKey: .moveToTrash)) ?? true
         autoDeleteOllama = (try? c.decodeIfPresent(Bool.self, forKey: .autoDeleteOllama)) ?? false
+        modelFolders = (try? c.decodeIfPresent([String].self, forKey: .modelFolders)) ?? []
+        autoDeleteFolders = (try? c.decodeIfPresent(Bool.self, forKey: .autoDeleteFolders)) ?? false
     }
 }
 
@@ -38,6 +46,7 @@ struct AppState: Codable {
     var lastSeenInUse: [String: Date] = [:] // last time a process or open file was seen using it
     var lastAutoRun: Date?
     var lastTick: Date?                     // last background-agent run; detects long gaps / clock jumps
+    var missingFolderRoots: Set<String> = [] // watched folders unreadable at the last scan (see Tracker.record)
 
     init() {}
 
@@ -53,6 +62,7 @@ struct AppState: Codable {
         lastSeenInUse = (try? c.decode([String: Date].self, forKey: .lastSeenInUse)) ?? [:]
         lastAutoRun = try? c.decode(Date.self, forKey: .lastAutoRun)
         lastTick = try? c.decode(Date.self, forKey: .lastTick)
+        missingFolderRoots = (try? c.decode(Set<String>.self, forKey: .missingFolderRoots)) ?? []
     }
 }
 
@@ -80,9 +90,13 @@ enum Store {
         return s
     }
 
-    /// Load, change, save — re-reading first so the app and the agent don't overwrite each other.
+    /// Load, change, save under an exclusive lock on state.lock, so the app and the agent can't interleave and lose
+    /// each other's changes (review L7).
     @discardableResult
     static func update(_ change: (inout AppState) -> Void) -> AppState {
+        let fd = open(dir.appendingPathComponent("state.lock").path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        if fd >= 0 { flock(fd, LOCK_EX) }
+        defer { if fd >= 0 { flock(fd, LOCK_UN); close(fd) } }
         var s = load()
         change(&s)
         if let data = try? encoder.encode(s) { try? data.write(to: stateURL, options: .atomic) }

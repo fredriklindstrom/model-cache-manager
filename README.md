@@ -18,7 +18,8 @@ Works with anything that downloads through `huggingface_hub`: MLX (`mlx-lm`, `ml
 - **Keep**: tick it to exclude a single model from auto-delete.
 - **Notes**: a free-text comment per model ("used by my nightly job", "benchmark only, delete after Friday").
 - **Auto-delete**: remove models not used for *N* days (default 30), checked by a lightweight background agent.
-- **Locks**: a model is never deleted, by hand or automatically, while a running process names it, holds its files open, or a launch agent or daemon on your Mac refers to it. An Ollama model is also locked while the Ollama server has it loaded (`ollama ps`); `ollama stop <name>` unloads it. If the server's answer can't be read, the Ollama models are locked until it can (Hugging Face models are unaffected).
+- **Model folders**: models that live outside both stores (benchmark downloads, `hf download --local-dir`, loose GGUF files) can be listed too. Add a folder with **Model Folders › Add Folder…** in the footer (or `--add-folder PATH`). An entry directly inside it becomes a row (with a *Folder* badge) only when it is clearly a model: a folder whose weights files (`.gguf`, `.safetensors`, `.bin`, `.pt`, … within three levels) add up to at least 20 MB and to most of its bytes, or a weights file of at least 20 MB. Parts of a split GGUF (`name-00001-of-00003.gguf`) are one row, and an incomplete set can't be deleted. A folder holding a git checkout, an app bundle or `node_modules` is never a model, and nothing else in the watched folder is listed. Folders are walked through held, no-follow handles, links are never followed or deleted through, and every link under a watched folder that points into the Hugging Face cache, Ollama's store or another watched folder keeps the model it points into from being deleted, so nothing can break a folder model behind its back. A hard-linked file frees nothing and isn't counted. A watched folder may not be `/`, your home folder or anything above it, a system folder (`/System`, `/Library`, `/Applications`, `~/Library`, …), inside or above either store, or inside or above another watched folder; these checks compare the folders themselves, not their paths, so an alias path can't get round them. Auto-delete leaves these models alone unless you also switch on *Include models in watched folders*, and a watched drive that was unplugged starts a fresh observation period when it comes back. Stopping watching a folder deletes nothing. One limit: only links *under* watched folders are seen. A link somewhere else on your Mac that points into a watched-folder model doesn't stop that model being deleted (the same is true of links into the Hugging Face cache from outside it).
+- **Locks**: a model is never deleted, by hand or automatically, while a running process names it, holds its files open, or a launch agent or daemon on your Mac refers to it. This works for any file name: the checks run `ps` and `lsof` in a UTF-8 locale and read launch-agent plists' own strings (before 1.3, a path with non-ASCII characters such as `Modèles` was missed). A name `lsof` still can't print locks the models it might belong to. A process working inside a watched folder that names a model by a relative path (`--model qwen3-8b`) counts too. An Ollama model is also locked while the Ollama server has it loaded (`ollama ps`); `ollama stop <name>` unloads it. If the server's answer can't be read, the Ollama models are locked until it can (Hugging Face models are unaffected).
 
 ## How "last used" works, and why it's careful
 
@@ -114,6 +115,15 @@ APP="$HOME/Applications/Model Cache Manager.app/Contents/MacOS/ModelCacheManager
 
 `store` is `hf` or `ollama`. `totals.ollama.complete` is `false`, with an `incomplete_reason`, when part of the Ollama store couldn't be read; Ollama deletes are refused until it can. `exclusive_bytes` is what deleting frees; `total_bytes` includes files shared with other models. `last_used` and `lock_reason` are `null` when there's nothing to report. `--delete` refuses to run when `usage_reliable` would be false.
 
+
+Watched model folders:
+
+```bash
+"$HOME/Applications/Model Cache Manager.app/Contents/MacOS/ModelCacheManager" --add-folder ~/benchmarks/models
+"$HOME/Applications/Model Cache Manager.app/Contents/MacOS/ModelCacheManager" --remove-folder ~/benchmarks/models   # deletes nothing
+```
+
+Folder models appear in `--list` with ids `folder:<absolute path>` (store `folder`) and can be deleted with `--delete` like any other.
 ## Rebuilding the icon
 
 `swift scripts/make_icon.swift` crops the mark from `Assets/logo.png` into `Assets/AppIcon-1024.png`. `build.sh` packages the `.icns`.

@@ -40,6 +40,19 @@ final class DirHandle {
         return st
     }
 
+    /// `lstat` of `name` in this folder, whatever it is (a link is described, never followed).
+    func entryStat(_ name: String) -> stat? {
+        guard Self.isPlainName(name) else { return nil }
+        var st = stat()
+        return fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 ? st : nil
+    }
+
+    /// This folder's own `fstat`.
+    func ownStat() -> stat? {
+        var st = stat()
+        return fstat(fd, &st) == 0 ? st : nil
+    }
+
     /// The folder at `path` (not following a final link) is still this open folder: same device and inode.
     func isStill(at path: String) -> Bool {
         var a = stat(), b = stat()

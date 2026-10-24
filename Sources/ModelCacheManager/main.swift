@@ -10,11 +10,28 @@ if args.contains("--agent") {
     exit(0)
 }
 
+if let i = args.firstIndex(of: "--add-folder"), i + 1 < args.count {
+    if let err = ViewModel.watchFolder(args[i + 1]) { print(printable(err)); exit(1) }
+    let real = realPath((args[i + 1] as NSString).expandingTildeInPath)
+    Store.log("Watching model folder \(real)")
+    print(printable("watching \(real)"))
+    exit(0)
+}
+
+if let i = args.firstIndex(of: "--remove-folder"), i + 1 < args.count {
+    let real = realPath((args[i + 1] as NSString).expandingTildeInPath)
+    let before = Store.load().settings.modelFolders.count
+    let after = Store.update { $0.settings.modelFolders.removeAll { $0 == real || $0 == args[i + 1] } }.settings.modelFolders.count
+    print(printable(after < before ? "stopped watching \(real) (nothing deleted)" : "not a watched folder: \(real)"))
+    exit(after < before ? 0 : 1)
+}
+
 if args.contains("--list") {
     let res = CacheScanner.scan(state: Store.load())
     let sorted = res.models.sorted(by: { $0.exclusiveBytes > $1.exclusiveBytes })
     let hfCount = res.models.filter { $0.store == .hf }.count
-    let ollamaCount = res.models.count - hfCount
+    let folderCount = res.models.filter { $0.store == .folder }.count
+    let ollamaCount = res.models.count - hfCount - folderCount
     if args.contains("--json") {
         // Machine-readable, for scripts and benchmark harnesses. Field names are a stable interface.
         let iso = ISO8601DateFormatter()
@@ -26,12 +43,15 @@ if args.contains("--list") {
             "locked": m.isLocked, "lock_reason": m.inUseReason.map { $0 as Any } ?? NSNull(),
             "keep": m.excluded, "project_kept": m.projectKept, "projects": m.projectNames, "note": m.note,
             "delete_blocked": m.deleteBlocked.map { $0 as Any } ?? NSNull(),
+            "folder_root": m.folderRoot.map { $0 as Any } ?? NSNull(),
         ] }
         let totals: [String: Any] = [
             "hf": ["models": hfCount, "bytes": res.uniqueBytes, "root": realPath(CacheScanner.cacheRoot.path)],
             "ollama": ["models": ollamaCount, "bytes": res.ollamaBytes, "root": realPath(OllamaStore.root.path),
                        "present": res.ollamaPresent, "complete": res.ollamaIncomplete == nil,
                        "incomplete_reason": res.ollamaIncomplete.map { $0 as Any } ?? NSNull()],
+            "folders": ["models": folderCount, "bytes": res.folderBytes, "roots": Store.load().settings.modelFolders,
+                        "problems": res.folderProblems],
             "usage_reliable": res.usageReliable,
             "leftover_staging": res.leftoverStaging,
         ]
@@ -53,6 +73,8 @@ if args.contains("--list") {
     } else {
         print("\(res.models.count) repos, \(formatBytes(res.uniqueBytes)) on disk")
     }
+    if folderCount > 0 { print("\(folderCount) model\(folderCount == 1 ? "" : "s") in watched folders, \(formatBytes(res.folderBytes))") }
+    for p in res.folderProblems { print(printable("Watched folder not read: \(p)")) }
     for p in res.leftoverStaging { print(printable("Interrupted delete, files still on disk: \(p)")) }
     if let why = res.ollamaIncomplete { print(printable("Ollama store not fully readable (\(why)); Ollama models can't be deleted until it is")) }
     exit(0)

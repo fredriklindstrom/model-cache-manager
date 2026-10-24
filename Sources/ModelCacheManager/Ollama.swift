@@ -261,7 +261,10 @@ enum OllamaStore {
     /// Whether a command line or launch agent names this model as a whole word (`ollama run qwen3:8b`, but not
     /// `qwen3:8b-q4`), or one of its blobs (a runner started with `--model …/blobs/sha256-…`).
     static func mentions(_ text: String, _ m: CachedModel) -> Bool {
-        if m.ollamaBlobs.contains(where: { text.contains($0) }) { return true }
+        // Digests are hex, so a literal byte search matches the same; Foundation's default `contains` compares
+        // Unicode-aware and took ~17 s across ~1,200 long command lines.
+        let ns = text as NSString
+        if m.ollamaBlobs.contains(where: { ns.range(of: $0, options: .literal).location != NSNotFound }) { return true }
         guard let q = m.ollamaName?.lowercased() else { return false }
         let tokens = text.split { !($0.isLetter || $0.isNumber || "._:/-".contains($0)) }
         return tokens.contains { qualify(String($0)) == q }

@@ -61,6 +61,7 @@ enum Deleter {
         if let r = m.inUseReason { throw DeleteError.locked(r) }
         if let r = m.deleteBlocked { throw DeleteError.unsafe(r) }
         if m.store == .ollama { return try deleteOllama(m, toTrash: toTrash) }
+        if m.store == .folder { return try deleteFolder(m, toTrash: toTrash) }
         let root = realPath(CacheScanner.cacheRoot.path)
         guard root != "/", isRealDirectory(root) else { throw DeleteError.unsafe("the cache root is not a folder") }
         let folder = try verifiedFolder(m, root: root)
@@ -150,6 +151,85 @@ enum Deleter {
         var landed: NSURL?
         try FileManager.default.trashItem(at: URL(fileURLWithPath: itemPath), resultingItemURL: &landed)
         return landed?.path
+    }
+
+    // MARK: Model folders
+
+    /// Removes a model from a watched folder: the entries directly in that folder that make it up (a folder, a
+    /// file, or the parts of a split GGUF). Same mechanics as a Hugging Face delete: the watched folder is opened
+    /// with no link anywhere on its path, each entry is re-checked and then moved by name into a staging folder
+    /// beside it, and removed (or sent to the Trash as one item) from there, never following a link. A Trash
+    /// delete puts everything back if any step fails.
+    private static func deleteFolder(_ m: CachedModel, toTrash: Bool) throws -> DeleteOutcome {
+        guard let root = m.folderRoot, !m.folderMembers.isEmpty, m.kind == "folder" || m.kind == "file" else {
+            throw DeleteError.unsafe("\(m.id) is not a model in a watched folder")
+        }
+        // Still a folder you watch, and still passing every check (a store may have moved under it since).
+        let watched = Store.load().settings.modelFolders
+        guard watched.contains(root) else { throw DeleteError.unsafe("\(root) is no longer a watched folder") }
+        if let p = FolderStore.problem(root, others: watched) { throw DeleteError.unsafe("\(root): \(p)") }
+        var rootSt = stat()
+        guard lstat(root, &rootSt) == 0 else { throw DeleteError.unsafe("can't read \(root)") }
+        func verify() throws {
+            for n in m.folderMembers {
+                let p = root + "/" + n
+                var st = stat()
+                guard !n.isEmpty, !n.contains("/"), !n.hasPrefix("."),
+                      m.kind == "folder" ? isRealDirectory(p) : isRealFile(p), realPath(p) == p,
+                      lstat(p, &st) == 0, st.st_dev == rootSt.st_dev else {
+                    throw DeleteError.unsafe("\(n) is a symbolic link, missing, on another volume, or not what the scan found")
+                }
+            }
+        }
+        try verify()
+        guard let rootDir = DirHandle.open(root) else { throw DeleteError.unsafe("couldn't open \(root)") }
+        let holderName = ".mcc-staging-" + UUID().uuidString
+
+        guard toTrash else {
+            let holder = try rootDir.makeFolder(holderName)
+            var moved: [String] = []
+            do {
+                try verify()    // re-check immediately before the move
+                for n in m.folderMembers { try rootDir.move(n, to: holder, as: n); moved.append(n) }
+            } catch {
+                for n in moved.reversed() { try? holder.move(n, to: rootDir, as: n) }
+                rootDir.removeEmptyFolder(holderName)
+                throw error
+            }
+            var removed: Int64 = 0
+            do { for n in moved { removed += try holder.removeTree(n) } } catch {
+                let why: String
+                if case DeleteError.unsafe(let r) = error { why = r } else { why = error.localizedDescription }
+                throw DeleteError.interrupted("\(why); what's left of \(m.name) is in \(root)/\(holderName)")
+            }
+            rootDir.removeEmptyFolder(holderName)
+            return DeleteOutcome(freed: removed, trashLocation: nil)
+        }
+
+        let itemName = trashName(m.name, suffix: " (model folder)")
+        var undo: [() throws -> Void] = []
+        var made: [(parent: DirHandle, name: String)] = []
+        func rollback() {
+            var stranded = false
+            for u in undo.reversed() { do { try u() } catch { stranded = true } }
+            for f in made.reversed() { f.parent.removeEmptyFolder(f.name) }   // only ever removes EMPTY folders
+            if stranded { Store.log("Could not fully undo a failed delete of \(m.id); its files are in \(root)/\(holderName)") }
+        }
+        do {
+            let holder = try rootDir.makeFolder(holderName); made.append((rootDir, holderName))
+            let item = try holder.makeFolder(itemName); made.append((holder, itemName))
+            try verify()        // re-check immediately before the move
+            for n in m.folderMembers {
+                try rootDir.move(n, to: item, as: n)
+                undo.append { try item.move(n, to: rootDir, as: n) }
+            }
+            let landed = try trash(root: root, holderName: holderName, holder: holder, itemName: itemName, item: item)
+            rootDir.removeEmptyFolder(holderName)
+            return DeleteOutcome(freed: m.exclusiveBytes, trashLocation: landed)
+        } catch {
+            rollback()
+            throw error
+        }
     }
 
     // MARK: Ollama

@@ -87,6 +87,8 @@ final class ViewModel: ObservableObject {
     @Published var uniqueBytes: Int64 = 0
     @Published var ollamaBytes: Int64 = 0
     @Published var ollamaPresent = false
+    @Published var folderBytes: Int64 = 0
+    @Published var folderProblems: [String] = []
     @Published var leftoverStaging: [String] = []
     @Published var selection = Set<CachedModel.ID>()
     @Published var sortOrder = [KeyPathComparator(\CachedModel.exclusiveBytes, order: .reverse)]
@@ -96,6 +98,17 @@ final class ViewModel: ObservableObject {
     @Published var logLines: [String] = []
     @Published var search = ""
     @Published var message: String?
+    @Published var deleting: DeleteProgress?
+
+    /// Drives the "Deleting…" sheet, which stays up until the deletes and the rescan after them are done.
+    struct DeleteProgress {
+        let total: Int
+        let toTrash: Bool
+        var done = 0
+        var current = "Checking which models are in use…"
+        var rescanning = false
+        var result: String?
+    }
 
     init(manageAgent: Bool = true) {
         // Re-point the agent if the installed app moved; never from a dev build or download.
@@ -135,12 +148,12 @@ final class ViewModel: ObservableObject {
         return v?.volumeAvailableCapacityForImportantUsage ?? 0
     }
 
-    func refresh() {
+    func refresh(then done: (() -> Void)? = nil) {
         scanning = true
         let st = Store.load()
         Task.detached(priority: .userInitiated) {
             let res = CacheScanner.scan(state: st)
-            let newState = Store.update { Tracker.record(res.models, into: &$0) }
+            let newState = Store.update { Tracker.record(res, into: &$0) }
             let merged = Tracker.merge(res.models, newState)
             await MainActor.run {
                 self.state = newState
@@ -148,10 +161,13 @@ final class ViewModel: ObservableObject {
                 self.uniqueBytes = res.uniqueBytes
                 self.ollamaBytes = res.ollamaBytes
                 self.ollamaPresent = res.ollamaPresent
+                self.folderBytes = res.folderBytes
+                self.folderProblems = res.folderProblems
                 self.leftoverStaging = res.leftoverStaging
                 self.selection = self.selection.intersection(Set(merged.map(\.id)))
                 self.logLines = Store.recentLog(300)
                 self.scanning = false
+                done?()
             }
         }
     }
@@ -235,6 +251,34 @@ final class ViewModel: ObservableObject {
         reloadState()
     }
 
+    /// Model folders: add one (Open panel) or stop watching one. Removing only stops listing it; nothing is deleted.
+    func addModelFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Watch Folder"
+        panel.message = "Choose a folder that holds model folders or GGUF files. Each one inside it is listed."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        if let err = Self.watchFolder(url.path) { message = err; return }
+        Store.log("Watching model folder \(realPath(url.path))")
+        refresh()
+    }
+
+    /// Adds a watched folder; nil on success, or why not. Also used by `--add-folder`.
+    nonisolated static func watchFolder(_ path: String) -> String? {
+        let real = realPath((path as NSString).expandingTildeInPath)
+        if let p = FolderStore.problem(real, others: Store.load().settings.modelFolders) { return "Can't watch \(real): \(p)." }
+        Store.update { s in if !s.settings.modelFolders.contains(real) { s.settings.modelFolders.append(real) } }
+        return nil
+    }
+
+    func removeModelFolder(_ path: String) {
+        Store.update { $0.settings.modelFolders.removeAll { $0 == path } }
+        Store.log("Stopped watching model folder \(path)")
+        refresh()
+    }
+
     func setTracking(_ on: Bool) {
         do {
             if on { try Agent.install() } else {
@@ -251,6 +295,7 @@ final class ViewModel: ObservableObject {
         let ids = deletable.map(\.id)
         let toTrash = state.settings.moveToTrash
         scanning = true
+        deleting = DeleteProgress(total: ids.count, toTrash: toTrash)
         Task.detached(priority: .userInitiated) {
             // Re-scan right before deleting: the table can be hours old. A model that started being
             // used, or that now shares files with a newer download, is judged on its current state.
@@ -267,6 +312,7 @@ final class ViewModel: ObservableObject {
                 targets.append(m)
             }
             for m in targets {
+                await MainActor.run { self.deleting?.current = m.name }
                 do {
                     let outcome = try Deleter.delete(m, toTrash: toTrash)
                     freed += outcome.freed
@@ -276,15 +322,18 @@ final class ViewModel: ObservableObject {
                     failed.append("\(m.name): \(error.localizedDescription)")
                     Store.log("Delete failed for \(m.id): \(error.localizedDescription)")
                 }
+                await MainActor.run { self.deleting?.done += 1 }
             }
             let freedTotal = freed, failures = failed
             await MainActor.run {
                 var text = "\(toTrash ? "Moved to Trash" : "Deleted"): \(ids.count - failures.count) model(s), \(formatBytes(freedTotal))."
                 if toTrash { text += " Empty the Trash to free the space." }
                 if !failures.isEmpty { text += "\nFailed: " + failures.joined(separator: "; ") }
-                self.message = text
                 self.selection.removeAll()
-                self.refresh()
+                self.deleting?.done = ids.count   // skipped models count as handled
+                self.deleting?.rescanning = true
+                self.deleting?.current = "Rescanning the cache…"
+                self.refresh { self.deleting?.result = text }
             }
         }
     }
@@ -335,6 +384,9 @@ struct ContentView: View {
         .searchable(text: $vm.search, prompt: "Filter by name, note or project")
         .sheet(item: $projectSheet) { sheet in
             ProjectNameSheet(sheet: sheet).environmentObject(vm)
+        }
+        .sheet(isPresented: Binding(get: { vm.deleting != nil }, set: { if !$0 { vm.deleting = nil } })) {
+            DeletingSheet().environmentObject(vm)
         }
         .confirmationDialog("Delete project “\(projectToDelete?.name ?? "")”?",
                             isPresented: Binding(get: { projectToDelete != nil }, set: { if !$0 { projectToDelete = nil } }),
@@ -409,7 +461,10 @@ struct ContentView: View {
             if let p = vm.currentProject { projectHeader(p); Divider() }
             table
                 .overlay {
-                    if vm.currentProject != nil && vm.visible.isEmpty && vm.search.isEmpty {
+                    if vm.models.isEmpty && vm.scanning {
+                        ProgressView("Scanning the model cache…")
+                            .padding(40)
+                    } else if vm.currentProject != nil && vm.visible.isEmpty && vm.search.isEmpty {
                         Text("Drag models here from All Models, or right-click a model and choose Add to Project.")
                             .foregroundStyle(.secondary)
                             .padding(40)
@@ -497,6 +552,7 @@ struct ContentView: View {
                 vm.selection = ids
                 confirmDelete = true
             }
+            .disabled(vm.scanning)
         }
     }
 
@@ -512,6 +568,7 @@ struct ContentView: View {
                         HStack(spacing: 5) {
                             Text(m.name).lineLimit(1)
                             if m.store == .ollama { StoreBadge(title: "Ollama", help: "In Ollama's model store") }
+                            if m.store == .folder { StoreBadge(title: "Folder", help: m.folder.path) }
                         }
                         Text(m.inUseReason ?? m.kind)
                             .font(.caption)
@@ -570,6 +627,10 @@ struct ContentView: View {
         .contextMenu(forSelectionType: CachedModel.ID.self) { ids in
             rowMenu(ids)
         }
+        // ⌫ asks the same confirmation as the toolbar button.
+        .onDeleteCommand {
+            if !vm.deletable.isEmpty && !vm.scanning { confirmDelete = true }
+        }
     }
 
     private var autoPanel: some View {
@@ -592,6 +653,12 @@ struct ContentView: View {
                     Toggle("Include Ollama models (models you made with `ollama create` may not be downloadable again)",
                            isOn: Binding(get: { vm.state.settings.autoDeleteOllama },
                                          set: { v in vm.updateSettings { $0.autoDeleteOllama = v } }))
+                        .disabled(!vm.trackingOn || !vm.state.settings.autoDeleteEnabled)
+                }
+                if !vm.state.settings.modelFolders.isEmpty {
+                    Toggle("Include models in watched folders (they may not be downloadable again)",
+                           isOn: Binding(get: { vm.state.settings.autoDeleteFolders },
+                                         set: { v in vm.updateSettings { $0.autoDeleteFolders = v } }))
                         .disabled(!vm.trackingOn || !vm.state.settings.autoDeleteEnabled)
                 }
                 Picker("Deleted models go to", selection: Binding(get: { vm.state.settings.moveToTrash },
@@ -638,6 +705,7 @@ struct ContentView: View {
             if vm.scanning { ProgressView().controlSize(.small) }
             Text("\(vm.models.count) models · \(formatBytes(vm.uniqueBytes)) in cache"
                  + (vm.ollamaPresent ? " · \(formatBytes(vm.ollamaBytes)) in Ollama" : "")
+                 + (vm.state.settings.modelFolders.isEmpty ? "" : " · \(formatBytes(vm.folderBytes)) in folders")
                  + " · \(formatBytes(vm.freeBytes)) free on disk")
                 .foregroundStyle(.secondary)
             if !vm.leftoverStaging.isEmpty {
@@ -650,7 +718,27 @@ struct ContentView: View {
                 .foregroundStyle(.orange)
                 .help("A delete was interrupted. Its files are in a hidden folder in the cache: move them back or to the Trash.")
             }
+            if !vm.folderProblems.isEmpty {
+                Label("\(vm.folderProblems.count) watched folder\(vm.folderProblems.count == 1 ? "" : "s") not read", systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                    .help(vm.folderProblems.joined(separator: "\n"))
+            }
             Spacer()
+            Menu("Model Folders") {
+                Button("Add Folder…") { vm.addModelFolder() }
+                if !vm.state.settings.modelFolders.isEmpty {
+                    Divider()
+                    ForEach(vm.state.settings.modelFolders, id: \.self) { f in
+                        Menu(f) {
+                            Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: f)]) }
+                            Button("Stop Watching (deletes nothing)") { vm.removeModelFolder(f) }
+                        }
+                    }
+                }
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("Folders of models outside the Hugging Face cache and Ollama, e.g. benchmark downloads or GGUF files")
             Button("Show Cache in Finder") {
                 NSWorkspace.shared.activateFileViewerSelecting([CacheScanner.cacheRoot])
             }
@@ -677,6 +765,46 @@ struct ContentView: View {
         if vm.deletable.contains(where: { $0.excluded || $0.projectKept }) { lines.append("\nSome of these are kept out of auto-delete; deleting by hand still removes them.") }
         if !vm.state.settings.moveToTrash { lines.append("\nThis cannot be undone.") }
         return lines.joined(separator: "\n")
+    }
+}
+
+/// Modal progress for a delete: can't be dismissed until the deletes and the rescan are done, then shows the result.
+struct DeletingSheet: View {
+    @EnvironmentObject var vm: ViewModel
+
+    var body: some View {
+        let p = vm.deleting
+        VStack(alignment: .leading, spacing: 12) {
+            if let p, let result = p.result {
+                Text("Done").font(.headline)
+                Text(result)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                HStack {
+                    Spacer()
+                    Button("OK") { vm.deleting = nil }.keyboardShortcut(.defaultAction)
+                }
+            } else if let p {
+                Text(p.toTrash ? "Moving to Trash…" : "Deleting…").font(.headline)
+                if p.rescanning {
+                    ProgressView()
+                        .progressViewStyle(.linear)
+                } else {
+                    ProgressView(value: Double(p.done), total: Double(max(p.total, 1)))
+                }
+                Text(p.current)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text("\(p.done) of \(p.total) model\(p.total == 1 ? "" : "s")")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+        }
+        .padding(24)
+        .frame(width: 440)
+        .interactiveDismissDisabled()
     }
 }
 
