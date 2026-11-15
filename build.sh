@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build "Model Cache Manager.app". Pass --install to copy it into ~/Applications.
+# Build "Model Cache Manager.app". Pass --install to copy it into ~/Applications and link ~/.local/bin/llmavail.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -47,4 +47,13 @@ if [ "${1:-}" = "--install" ]; then
   rm -rf ~/Applications/"Model Cache Manager.app"
   cp -R "$APP" ~/Applications/
   echo "Installed to ~/Applications/Model Cache Manager.app"
+  # llmavail is the same binary under another name (read-only: which models are here and complete).
+  BIN=~/.local/bin/llmavail
+  if [ -e "$BIN" ] && [ ! -L "$BIN" ]; then
+    echo "Not linking $BIN: something that isn't a symlink is already there"
+  else
+    mkdir -p ~/.local/bin
+    ln -sfn ~/Applications/"Model Cache Manager.app/Contents/MacOS/ModelCacheManager" "$BIN"
+    echo "Linked $BIN (put ~/.local/bin on your PATH to run llmavail)"
+  fi
 fi

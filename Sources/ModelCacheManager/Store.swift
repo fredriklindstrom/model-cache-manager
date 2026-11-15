@@ -67,14 +67,17 @@ struct AppState: Codable {
 }
 
 enum Store {
-    static let dir: URL = {
+    /// Where the state lives. Reading it never creates anything (llmavail is read-only); `dir` creates the folder.
+    static let path: URL = {
         let env = ProcessInfo.processInfo.environment["MCC_STATE_DIR"]
-        let d = env.map { URL(fileURLWithPath: $0) } ?? FileManager.default.homeDirectoryForCurrentUser
+        return env.map { URL(fileURLWithPath: $0) } ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/ModelCacheManager")
-        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
-        return d
     }()
-    static var stateURL: URL { dir.appendingPathComponent("state.json") }
+    static let dir: URL = {
+        try? FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
+        return path
+    }()
+    static var stateURL: URL { path.appendingPathComponent("state.json") }
     static var logURL: URL { dir.appendingPathComponent("activity.log") }
 
     private static let encoder: JSONEncoder = {

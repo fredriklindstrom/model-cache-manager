@@ -121,10 +121,15 @@ enum CacheScanner {
         return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cache/huggingface/hub")
     }
 
-    static func scan(state: AppState) -> ScanResult {
+    /// For llmavail, which reads Ollama's store itself and must not touch the network or any file's access time:
+    /// `includeOllama: false` leaves Ollama's store to llmavail's own reader (which checks every layer),
+    /// `askOllamaServer: false` skips the local server's `/api/ps`, `checkUsage: false` skips ps / lsof.
+    /// The app always does all three.
+    static func scan(state: AppState, includeOllama: Bool = true, askOllamaServer: Bool = true,
+                     checkUsage: Bool = true) -> ScanResult {
         let fm = FileManager.default
         let root = URL(fileURLWithPath: realPath(cacheRoot.path))
-        let ollama = OllamaStore.scan()
+        let ollama = includeOllama ? OllamaStore.scan() : OllamaStore.Scan()
         let folders = FolderStore.scan(state.settings.modelFolders)
         let listing = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
         // No readable HF cache, no Ollama store and no model folder: nothing to judge, so nothing may be auto-deleted.
@@ -202,6 +207,7 @@ enum CacheScanner {
             for r in reals { reposByReal[r, default: []].insert(id) }
         }
         for r in ollama.unlistedReals { reposByReal[r, default: []].insert("ollama-unlisted") }
+        metaFiles.formUnion(ollama.meta)   // manifests: the app's own scans read them, so their dates say nothing
         // A link inside a watched model folder that points into either store keeps that file from looking exclusive
         // (deleting the store's model would break the folder model). Folder files themselves stay out of the
         // stores' accounting: each folder model's sizes come from FolderStore.
@@ -273,8 +279,11 @@ enum CacheScanner {
         }
         var usageMap = reposByReal
         for (id, files) in folders.files { for f in files { usageMap[f, default: []].insert(id) } }
-        let usage = UsageDetector.detect(models: models, reposByReal: usageMap,
-                                         roots: [root.path] + (ollama.present ? [ollama.root] : []) + folders.roots)
+        let usage = checkUsage
+            ? UsageDetector.detect(models: models, reposByReal: usageMap,
+                                   roots: [root.path] + (ollama.present ? [ollama.root] : []) + folders.roots,
+                                   askOllamaServer: askOllamaServer)
+            : UsageDetector.Result()
         let now = Date()
         for i in models.indices {
             let id = models[i].id
@@ -309,7 +318,8 @@ enum UsageDetector {
     }
     static let unknownPrefix = "Can't tell if in use"
 
-    static func detect(models: [CachedModel], reposByReal: [String: Set<String>], roots: [String]) -> Result {
+    static func detect(models: [CachedModel], reposByReal: [String: Set<String>], roots: [String],
+                       askOllamaServer: Bool = true) -> Result {
         var r = Result()
 
         /// The program a command line runs, skipping interpreters: `python …/mlx_lm.server --model x` → `mlx_lm.server`.
@@ -414,7 +424,7 @@ enum UsageDetector {
         // 4. Models a running Ollama server has loaded (`ollama ps`). A stopped server is fine:
         //    its runner processes and the weights they hold open are already covered above.
         let ollamaModels = models.filter { $0.store == .ollama }
-        if !ollamaModels.isEmpty {
+        if !ollamaModels.isEmpty && askOllamaServer {
             switch OllamaStore.loaded() {
             case .failure(.notRunning): break
             // A bad reply locks the Ollama models only: Hugging Face deletes don't depend on the Ollama server.

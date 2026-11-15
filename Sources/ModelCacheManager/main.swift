@@ -5,6 +5,15 @@ import AppKit
 // Headless modes (used by the launch agent and for testing); otherwise open the window.
 let args = CommandLine.arguments
 
+// `llmavail` (a symlink to this binary, or `ModelCacheManager llmavail …`): read-only model availability. Checked
+// first, so none of the other modes' flags can be reached through it.
+if (args.first.map { ($0 as NSString).lastPathComponent } == "llmavail") {
+    exit(LLMAvailCLI.run(Array(args.dropFirst())))
+}
+if args.count > 1 && args[1] == "llmavail" {
+    exit(LLMAvailCLI.run(Array(args.dropFirst(2))))
+}
+
 if args.contains("--agent") {
     Agent.runOnce()
     exit(0)

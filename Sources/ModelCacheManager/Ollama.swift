@@ -7,6 +7,9 @@ import CryptoKit
 /// same problem as the Hugging Face `blobs/` store, so sizes, locks and deletes follow the same rules.
 enum OllamaStore {
     static let defaultHost = "registry.ollama.ai"
+    /// Ollama 0.40's `manifests-v2/` names the default registry `ollama.com`; `manifests/` says `registry.ollama.ai`.
+    /// Both are the same model, so they get the same id (and Keep, notes and history carry over).
+    static func normalHost(_ h: String) -> String { h.lowercased() == "ollama.com" ? defaultHost : h }
     /// Manifests are small JSON files; nothing bigger than this is ever read.
     private static let maxReadBytes = 4 << 20
     /// A manifest path component: no slash, no leading dot (so never "." or ".."). Only the host may hold a
@@ -23,9 +26,11 @@ enum OllamaStore {
         return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ollama/models")
     }
 
-    /// The store exists here. A `manifests` folder that is a symlink doesn't count: nothing is listed or deleted.
+    /// The store exists here: `manifests/`, or Ollama 0.40's `manifests-v2/`. A manifests folder that is a symlink
+    /// doesn't count: nothing is listed or deleted.
     static func isPresent(root: String) -> Bool {
-        root != "/" && Deleter.isRealDirectory(root) && Deleter.isRealDirectory(root + "/manifests")
+        root != "/" && Deleter.isRealDirectory(root)
+            && (Deleter.isRealDirectory(root + "/manifests") || Deleter.isRealDirectory(root + "/manifests-v2"))
     }
 
     private static func isValidPart(_ s: String) -> Bool { s.range(of: partPattern, options: .regularExpression) != nil }
@@ -38,11 +43,19 @@ enum OllamaStore {
 
     static func blobPath(_ hex: String, root: String) -> String { root + "/blobs/sha256-" + hex }
 
+    enum Layout { case v1, v2 }
+
     struct Manifest {
-        let path: String              // the manifest file (real path, no symlinks on the way)
-        let host, namespace, model, tag: String
-        let digests: Set<String>      // hex of every blob it uses (config + layers)
+        /// v1: the manifest file (real path, no symlinks on the way). v2: the tag entry in `manifests-v2/`
+        /// (usually a link into `blobs/`), never resolved.
+        let path: String
+        let host, namespace, model, tag: String   // host normalised (see normalHost)
+        let digests: Set<String>      // hex of every blob it uses (config + layers; v2 also its manifest blobs)
         let fileDigest: String        // sha256 of the manifest bytes: what Ollama reports as the model's digest
+        var layout = Layout.v1
+        /// v2: the manifest blobs themselves (the tag's own and, for a manifest list, each variant's). Bookkeeping
+        /// the app reads on every scan, so their dates are never evidence of use.
+        var metaDigests = Set<String>()
 
         var qualifiedName: String { "\(host)/\(namespace)/\(model):\(tag)" }
         /// "qwen3:8b", "someone/model:tag" or "hf.co/org/repo:tag", like `ollama list`.
@@ -56,7 +69,12 @@ enum OllamaStore {
     }
 
     struct References {
-        var manifests: [Manifest] = []
+        var manifests: [Manifest] = []    // manifests/ (the only layout this app deletes from)
+        /// manifests-v2/ (Ollama 0.40+). Listed and sized, and every blob they use counts as used, but never deleted
+        /// here: removing a v1 model must not take a layer a v2 manifest still needs.
+        var v2: [Manifest] = []
+        /// Lowercased ids of every v2 tag, duplicates included: a model with any of them is never deleted here.
+        var v2IDs = Set<String>()
         /// Digests named by anything under `manifests/` that isn't a readable manifest (a symlink, a file in the
         /// wrong place, JSON we can't parse). Never listed, but those blobs always count as used by someone else.
         var unlisted = Set<String>()
@@ -75,7 +93,144 @@ enum OllamaStore {
         let dupes = Dictionary(grouping: refs.manifests, by: \.id).filter { $0.value.count > 1 }
         for (_, ms) in dupes { for m in ms { refs.unlisted.formUnion(m.digests) } }
         refs.manifests.removeAll { dupes[$0.id] != nil }
+
+        let v2 = root + "/manifests-v2"
+        var st = stat()
+        if lstat(v2, &st) == 0 {
+            if (st.st_mode & S_IFMT) == S_IFDIR {
+                walkV2(v2, parts: [], root: root, into: &refs, budget: &budget)
+            } else {
+                refs.incomplete.append("\(v2) is not a folder")   // a link here could hide references
+            }
+        } else if errno != ENOENT {
+            refs.incomplete.append("can't inspect \(v2)")
+        }
+        refs.v2IDs = Set(refs.v2.map { $0.id.lowercased() })   // before duplicates are dropped (review M1)
+        let dupes2 = Dictionary(grouping: refs.v2, by: \.id).filter { $0.value.count > 1 }
+        for (_, ms) in dupes2 { for m in ms { refs.unlisted.formUnion(m.digests) } }
+        refs.v2.removeAll { dupes2[$0.id] != nil }
         return refs
+    }
+
+    private static let blobName = #"^sha256-[0-9a-f]{64}$"#
+
+    /// `manifests-v2/<host>/<namespace>/<model>/<tag>`: normally a link to the manifest's blob in `blobs/`. A
+    /// manifest list (one manifest per runner: MLX, llama.cpp, …) names each variant's manifest, also a blob.
+    /// A link to nothing names nothing; a link anywhere but `blobs/sha256-…` is read only for the digests it
+    /// mentions, which then count as used.
+    private static func walkV2(_ path: String, parts: [String], root: String, into refs: inout References, budget: inout Int) {
+        var st = stat()
+        guard lstat(path, &st) == 0 else {
+            if errno != ENOENT { refs.incomplete.append("can't inspect \(path)") }
+            return
+        }
+        let type = st.st_mode & S_IFMT
+        // Hidden plain files above the tag level (Finder's .DS_Store) are read for any digests they mention, as in
+        // manifests/, and otherwise ignored, so they don't block every delete (review 2, N1). Hidden links, folders
+        // and anything at the tag level stay strict.
+        if type == S_IFREG && parts.count < 4 && (path as NSString).lastPathComponent.hasPrefix(".") {
+            refs.unlisted.formUnion(harvest(path, budget: &budget, incomplete: &refs.incomplete))
+            return
+        }
+        if type == S_IFDIR && parts.count < 4 {
+            guard let names = try? FileManager.default.contentsOfDirectory(atPath: path) else {
+                refs.incomplete.append("can't list \(path)"); return
+            }
+            for n in names { walkV2(path + "/" + n, parts: parts + [n], root: root, into: &refs, budget: &budget) }
+            return
+        }
+        if parts.count == 4 && (type == S_IFLNK || type == S_IFREG) {
+            var target = stat()
+            if type == S_IFLNK && stat(path, &target) != 0 {
+                if errno != ENOENT { refs.incomplete.append("can't inspect \(path)") }
+                return   // a deleted model's leftover link: nothing on disk to protect
+            }
+            let file = type == S_IFLNK ? realPath(path) : path
+            let inBlobs = (file as NSString).deletingLastPathComponent == root + "/blobs"
+                && (file as NSString).lastPathComponent.range(of: blobName, options: .regularExpression) != nil
+            if type == S_IFREG || inBlobs {
+                let done: Bool = autoreleasepool {
+                    guard let data = readSmall(file) else { return false }
+                    budget -= data.count
+                    if budget < 0 { refs.incomplete.append("read budget used up at \(path)") }
+                    guard let m = parseV2(path, parts, data, root: root, refs: &refs, budget: &budget) else {
+                        refs.unlisted.formUnion(digestsMentioned(in: data))   // unparseable: everything it names stays protected
+                        return false
+                    }
+                    refs.v2.append(m)
+                    return true
+                }
+                if done { return }
+            }
+        }
+        // Anything else here (a tag that can't be parsed in full, a link out of blobs/, a file in the wrong place) may
+        // hide layers we can't see: no Ollama model is deleted until it's sorted out (security review 2026-11-15, H1).
+        // Links are never followed out of the store; plain files are read for the digests they mention.
+        refs.incomplete.append("can't fully read \(path) in manifests-v2")
+        if type == S_IFREG { refs.unlisted.formUnion(harvest(path, budget: &budget, incomplete: &refs.incomplete)) }
+    }
+
+    /// One v2 tag: a manifest, or a manifest list whose variants are manifests in `blobs/`. A variant whose
+    /// manifest blob is gone references nothing on disk; one that can't be read or parsed makes the store incomplete.
+    private static func parseV2(_ path: String, _ parts: [String], _ data: Data, root: String,
+                                refs: inout References, budget: inout Int) -> Manifest? {
+        guard isValidManifestPath(parts),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        let hex = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        var digests = Set([hex]), meta = Set([hex])
+        var mentioned = digestsMentioned(in: data)   // anything digest-shaped in these files that isn't theirs counts as used
+        func layers(_ j: [String: Any]) -> Set<String>? {
+            guard var entries = j["layers"] as? [[String: Any]] else { return nil }
+            if let c = j["config"] as? [String: Any] { entries.append(c) }
+            var out = Set<String>()
+            for e in entries {
+                guard let d = e["digest"] as? String, d.range(of: digestPattern, options: .regularExpression) != nil else { return nil }
+                out.insert(String(d.dropFirst("sha256:".count)).lowercased())
+            }
+            return out
+        }
+        if let list = json["manifests"] as? [[String: Any]] {
+            for e in list {
+                guard let d = e["digest"] as? String, d.range(of: digestPattern, options: .regularExpression) != nil else { return nil }
+                let sub = String(d.dropFirst("sha256:".count)).lowercased()
+                digests.insert(sub); meta.insert(sub)
+                let blob = blobPath(sub, root: root)
+                var st = stat()
+                guard lstat(blob, &st) == 0 else {
+                    if errno != ENOENT { refs.incomplete.append("can't inspect \(blob)") }
+                    // Gone: its layers are named nowhere else, so nothing on disk is protected for it. Unless the tag
+                    // changed in the last 10 minutes: then a pull may be writing it, reusing layers already here.
+                    // Not covered: a pull that fetches a variant later under an older, unchanged tag and writes no
+                    // -partial files (every layer already here). The same narrow race v1 pulls have.
+                    var tag = stat()
+                    let recent = Date().addingTimeInterval(-600).timeIntervalSince1970
+                    if lstat(path, &tag) == 0, Double(tag.st_mtimespec.tv_sec) > recent {
+                        refs.incomplete.append("\(path) changed in the last 10 minutes and names a variant that isn't on disk yet (a pull may be in progress)")
+                    }
+                    continue
+                }
+                guard (st.st_mode & S_IFMT) == S_IFREG, let sd = readSmall(blob) else {
+                    refs.incomplete.append("can't read variant manifest \(blob)"); continue   // its layers can't be seen
+                }
+                budget -= sd.count
+                if budget < 0 { refs.incomplete.append("read budget used up at \(blob)") }
+                mentioned.formUnion(digestsMentioned(in: sd))
+                guard let sj = try? JSONSerialization.jsonObject(with: sd) as? [String: Any], let ls = layers(sj) else {
+                    refs.incomplete.append("can't parse variant manifest \(blob)"); continue
+                }
+                digests.formUnion(ls)
+            }
+        } else if let ls = layers(json) {
+            digests.formUnion(ls)
+        } else {
+            return nil
+        }
+        refs.unlisted.formUnion(mentioned.subtracting(digests))   // as for v1
+        var m = Manifest(path: path, host: normalHost(parts[0]), namespace: parts[1], model: parts[2], tag: parts[3],
+                         digests: digests, fileDigest: hex)
+        m.layout = .v2
+        m.metaDigests = meta
+        return m
     }
 
     private static func walk(_ path: String, parts: [String], into refs: inout References, budget: inout Int) {
@@ -118,7 +273,7 @@ enum OllamaStore {
             digests.insert(String(d.dropFirst("sha256:".count)).lowercased())
         }
         let hex = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-        return Manifest(path: path, host: parts[0], namespace: parts[1], model: parts[2], tag: parts[3],
+        return Manifest(path: path, host: normalHost(parts[0]), namespace: parts[1], model: parts[2], tag: parts[3],
                         digests: digests, fileDigest: hex)
     }
 
@@ -213,6 +368,9 @@ enum OllamaStore {
         var reals: [String: Set<String>] = [:]   // model id → real paths of its manifest and blobs
         var unlistedReals = Set<String>()        // blobs named by something that isn't a listed manifest
         var incomplete: String?                  // why the store couldn't be read in full (blocks Ollama deletes)
+        /// Manifest files and manifest blobs: the app reads them on every scan, and on APFS a read can set the access
+        /// time, so their dates would only show the app's own scans. Never evidence of use (like HF `refs/`).
+        var meta = Set<String>()
     }
 
     static func scan() -> Scan {
@@ -222,14 +380,25 @@ enum OllamaStore {
         s.present = true
         let refs = references(root: s.root)
         s.incomplete = refs.incomplete.first.map { refs.incomplete.count > 1 ? "\($0), and \(refs.incomplete.count - 1) more" : $0 }
-        for m in refs.manifests {
+        // One row per model: the v1 manifest and the v2 tag of the same model (Ollama 0.40 writes both) are one.
+        let v2ByID = Dictionary(refs.v2.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        let v1IDs = Set(refs.manifests.map(\.id))
+        for entry in refs.manifests.map({ ($0 as Manifest?, v2ByID[$0.id]) }) + refs.v2.filter({ !v1IDs.contains($0.id) }).map({ (nil, $0) }) {
+            let (v1, v2) = entry
+            let m = (v1 ?? v2)!
             var model = CachedModel(id: m.id, kind: "model", name: m.displayName, folder: URL(fileURLWithPath: m.path))
             model.store = .ollama
             model.ollamaName = m.qualifiedName
             model.ollamaDigest = m.fileDigest
-            model.ollamaBlobs = m.digests.sorted()
+            let digests = (v1?.digests ?? []).union(v2?.digests ?? [])
+            model.ollamaBlobs = digests.sorted()
+            if let v = v2 { s.meta.formUnion(v.metaDigests.map { realPath(blobPath($0, root: s.root)) }) }
+            if v2 != nil || refs.v2IDs.contains(m.id.lowercased()) {
+                model.deleteBlocked = "Ollama 0.40 also keeps this model in its newer manifests-v2 layout, which this app doesn't delete from yet; remove it with `ollama rm \(m.displayName)`"
+            }
+            if let v = v1 { s.meta.insert(v.path) }
             s.models.append(model)
-            s.reals[m.id] = Set([m.path] + m.digests.map { realPath(blobPath($0, root: s.root)) })
+            s.reals[m.id] = Set((v1.map { [$0.path] } ?? []) + digests.map { realPath(blobPath($0, root: s.root)) })
         }
         s.unlistedReals = Set(refs.unlisted.map { realPath(blobPath($0, root: s.root)) })
         return s

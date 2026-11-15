@@ -285,11 +285,17 @@ enum Deleter {
         guard let mine = refs.manifests.first(where: { $0.path == manifest }), mine.fileDigest == m.ollamaDigest else {
             throw DeleteError.gone("\(m.id) changed since the scan; refresh and try again")
         }
+        // manifests-v2 (Ollama 0.40+) isn't deleted from here; a model that has a v2 tag too stays whole (the scan
+        // already blocks it, this is the re-check against the store as it is now).
+        if refs.v2IDs.contains(m.id.lowercased()) {
+            throw DeleteError.unsafe("Ollama 0.40 also keeps \(m.name) in its manifests-v2 layout, which this app doesn't delete from yet; remove it with `ollama rm \(m.name)`")
+        }
         if OllamaStore.downloadInProgress(root: root) {
             throw DeleteError.locked("an Ollama download is in progress; try again when it finishes")
         }
         var elsewhere = refs.unlisted
         for o in refs.manifests where o.path != manifest { elsewhere.formUnion(o.digests) }
+        for o in refs.v2 { elsewhere.formUnion(o.digests) }   // a layer a v2 manifest still needs is never removed
         // The scan's exclusive list already leaves out blobs another HF repo or Ollama model uses.
         // A layer only this manifest uses must be removable with it. Otherwise refuse: deleting the manifest alone
         // would orphan the layer (Ollama prunes it on its next start) and a Trash restore would come back broken.
